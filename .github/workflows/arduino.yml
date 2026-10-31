@@ -1,0 +1,83 @@
+name: Arduino_Compiler_CI
+
+# Replica of dotnet/iot .github/workflows/arduino.yml (gate + build shape),
+# with `shell: cmd`/`eng\ArduinoCsCI.cmd` swapped for bash so it can run on
+# ubuntu-latest. Everything that matters for the security analysis is identical:
+#   - `issue_comment` trigger with the /run-arduino-tests opt-in gate
+#   - same workflow-level permissions (contents: read, issues: write)
+#   - the same collaborator-permission authorization step
+#   - the same "resolve PR head via the API + checkout@v7 with repository/ref"
+#     build job that executes the checked-out repo's build script.
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  gate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/run-arduino-tests'))
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      head_repo: ${{ steps.resolve.outputs.head_repo }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Authorize commenter
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          perm=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission')
+          echo "Commenter '${ACTOR}' has permission: ${perm}"
+          case "${perm}" in
+            admin|write) ;;
+            *)
+              echo "::error::User '${ACTOR}' is not authorized to trigger the Arduino build (requires write or admin)."
+              exit 1
+              ;;
+          esac
+
+      - name: Resolve PR head
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr_number="${{ github.event.issue.number }}"
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+          pr_json=$(gh api "repos/${REPO}/pulls/${pr_number}")
+          head_sha=$(echo "${pr_json}" | jq -r '.head.sha')
+          head_repo=$(echo "${pr_json}" | jq -r '.head.repo.full_name')
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "head_repo=${head_repo}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.gate.outputs.head_repo }}
+          ref: ${{ needs.gate.outputs.head_sha }}
+          fetch-depth: 1
+
+      - name: Run Arduino CI build
+        shell: bash
+        run: |
+          bash eng/ArduinoCsCI.sh
